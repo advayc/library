@@ -71,6 +71,11 @@ function runBooking(date, capacity, onData, onDone) {
   child.on('close', code => onDone(code));
 }
 
+// --- background job store (in-memory) ---
+const jobs = new Map();
+let jobCounter = 0;
+
+
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {
   const { pathname } = url.parse(req.url || '');
@@ -100,33 +105,75 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Collect all output, then return a single JSON response.
-    // iPhone Shortcuts need a complete JSON body to parse — streaming won't work.
-    const lines = [];
-    runBooking(date, capacity,
-      (line) => lines.push(line),
-      (code) => {
-        const output = lines.join('');
-        // Try to extract the summary line (e.g. "✔ Meeting Room 304 booked for ...")
-        const summaryMatch = output.match(/✔\s*(.+)/);
-        const summary = summaryMatch ? summaryMatch[1].trim() : null;
-        const success = code === 0 || !!summary;
+    // Enqueue job and return job id immediately. Booking runs in background.
+    const jobId = `${Date.now().toString(36)}-${++jobCounter}`;
+    const job = {
+      id: jobId,
+      status: 'queued',
+      createdAt: Date.now(),
+      date,
+      capacity,
+      log: '',
+      exitCode: null,
+      summary: null,
+      finishedAt: null,
+    };
+    jobs.set(jobId, job);
 
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({
-          success,
-          summary: summary || (success ? 'Booking completed — check your account.' : 'Booking may have failed.'),
-          exitCode: code,
-          log: output,
-        }));
+    // Start processing in background
+    (async () => {
+      try {
+        job.status = 'running';
+        runBooking(date, capacity,
+          (line) => { job.log += line; job.lastUpdated = Date.now(); },
+          (code) => {
+            job.exitCode = code;
+            job.finishedAt = Date.now();
+            const summaryMatch = (job.log || '').match(/✔\s*(.+)/);
+            job.summary = summaryMatch ? summaryMatch[1].trim() : null;
+            job.status = (code === 0 || !!job.summary) ? 'done' : 'failed';
+          }
+        );
+      } catch (e) {
+        job.status = 'failed';
+        job.log += `\n[server error] ${e.message}`;
+        job.finishedAt = Date.now();
       }
-    );
+    })();
+
+    res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ jobId, statusUrl: `/status/${jobId}` }));
     return;
   }
 
   // 404 for everything else
+  // Status endpoint for polling job results: GET /status/<jobId>
+  if (req.method === 'GET' && pathname && pathname.startsWith('/status/')) {
+    const id = pathname.replace('/status/', '').trim();
+    const job = jobs.get(id);
+    if (!job) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Job not found' }));
+      return;
+    }
+    // Return job info (truncate log to reasonable length)
+    const maxLog = 50_000;
+    const log = job.log && job.log.length > maxLog ? job.log.slice(-maxLog) : job.log;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      id: job.id,
+      status: job.status,
+      createdAt: job.createdAt,
+      finishedAt: job.finishedAt,
+      exitCode: job.exitCode,
+      summary: job.summary,
+      log,
+    }));
+    return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Not found. Available: GET / | POST /book');
+  res.end('Not found. Available: GET / | POST /book | GET /status/<jobId>');
 });
 
 server.listen(PORT, () => {
