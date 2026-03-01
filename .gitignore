@@ -1,0 +1,52 @@
+### Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+### Environment
+.env
+.env.*
+
+### macOS
+.DS_Store
+
+### Logs
+*.log
+
+### Editor
+.vscode/
+
+### Build
+dist/
+build/
+
+### Browser profile, caches and large DBs (exclude from repo)
+playwright_profile/
+Default/
+component_crx_cache/
+extensions_crx_cache/
+GraphiteDawnCache/
+GrShaderCache/
+ShaderCache/
+Cache/
+Cache/**
+Local Storage/
+Session Storage/
+WebStorage/
+Safe Browsing/
+Shared Dictionary/
+
+### Chromium/Chrome files
+*Web Data*
+*Login Data*
+*Cookies*
+*History*
+*Top Sites*
+*Favicons*
+*Safe Browsing Cookies*
+*.db
+*-journal
+.env
+/node_modules

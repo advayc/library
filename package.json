@@ -1,0 +1,17 @@
+{
+  "name": "library-room-booker",
+  "version": "0.1.0",
+  "description": "Automate booking study rooms (Playwright).",
+  "main": "booking.js",
+  "scripts": {
+    "start": "node booking.js",
+    "install-deps": "npm install playwright chrono-node inquirer dotenv"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "chrono-node": "^2.3.1",
+    "dotenv": "^16.3.1",
+    "inquirer": "^9.2.7",
+    "playwright": "^1.38.0"
+  }
+}
