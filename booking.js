@@ -1285,8 +1285,9 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   // ── Add to Notion Calendar ──
   try {
     await addToNotionCalendar({
-      roomCode: room.code  || '',
-      roomLabel: room.label || room.name || room.code || 'Room',
+      roomCode: room.roomCode || room.code || '',
+      roomNum:  room.roomNum  || '',
+      roomLabel: room.label || room.name || room.roomCode || room.code || 'Room',
       start,
       end,
     });

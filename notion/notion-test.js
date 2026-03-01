@@ -20,16 +20,16 @@ async function main() {
     process.exit(1);
   }
 
-  // March 6, 2026 18:00-20:00 local time
-  const start = new Date('2026-03-06T18:00:00' );
-  const end   = new Date('2026-03-06T20:00:00' );
+  // March 7, 2026 (Saturday) 14:00-16:00 local time (EST)
+  const start = new Date('2026-03-07T14:00:00' );
+  const end   = new Date('2026-03-07T16:00:00' );
 
   console.log('\nAttempting to create a Notion calendar entry for:');
-  console.log(`  Title: Room 304 booked`);
+  console.log(`  Title: Room 299 booked`);
   console.log(`  Start: ${start.toString()}`);
   console.log(`  End:   ${end.toString()}`);
-
-  const page = await addToNotionCalendar({ roomCode: 'MR 304', roomLabel: '304 | MR 304', start, end });
+// dummy data for testing the database integration
+  const page = await addToNotionCalendar({ roomCode: 'MR 299', roomNum: '299', roomLabel: '299 | MR 299', start, end, titlePrefix: '[TEST] ' });
   if (page) console.log('\nTest succeeded.');
   else console.log('\nTest did not create a page — check errors above.');
 }

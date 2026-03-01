@@ -18,7 +18,8 @@ const { Client } = require('@notionhq/client');
  * @param {Date}    opts.start     - booking start time
  * @param {Date}    opts.end       - booking end time
  */
-async function addToNotionCalendar({ roomCode, roomLabel, start, end }) {
+async function addToNotionCalendar(opts) {
+  const { roomCode, roomLabel, start, end } = opts;
   const token  = process.env.NOTION_TOKEN;
   const dbId   = process.env.NOTION_DATABASE_ID;
 
@@ -29,27 +30,52 @@ async function addToNotionCalendar({ roomCode, roomLabel, start, end }) {
     return null;
   }
 
-  // Build the display title: prefer a numeric room code (e.g. "Room 304 booked").
+  // Build the display title: prefer the numeric room number (e.g. "Room 304 booked").
+  const roomNum = opts.roomNum || '';
   let title;
-  if (roomCode) {
+  if (roomNum) {
+    // Direct room number from scrape (e.g. "304")
+    title = `Room ${roomNum} booked`;
+  } else if (roomCode) {
+    // Strip "MR" prefix from code like "MR 304"
     const num = String(roomCode).replace(/^MR\s*/i, '').trim();
     title = `Room ${num} booked`;
   } else if (roomLabel) {
-    const m = String(roomLabel).match(/\b(\d{1,4})\b/);
+    // Try extracting a 3-digit room number, ignoring capacity digits
+    const m = String(roomLabel).match(/\b(\d{3})\b/);
     if (m) title = `Room ${m[1]} booked`;
     else title = `${roomLabel} booked`;
   } else {
     title = 'Room booked';
   }
 
-  // Notion expects a local datetime string when a time_zone is provided
-  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  function toLocalDateTimeString(d) {
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  // Allow callers (tests) to prefix the title, e.g. "[TEST] "
+  if (opts && typeof opts.titlePrefix === 'string' && opts.titlePrefix.length) {
+    title = `${opts.titlePrefix}${title}`;
   }
-  const startISO = toLocalDateTimeString(start);
-  const endISO = toLocalDateTimeString(end);
+
+  // Build ISO timestamps with explicit local timezone offset (e.g. 2026-03-06T14:00:00-05:00)
+  // This avoids Notion misinterpreting UTC vs local time.
+  function toISOWithOffset(d) {
+    const pad = (n) => String(n).padStart(2, '0');
+    const y = d.getFullYear();
+    const m = pad(d.getMonth() + 1);
+    const day = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const mm = pad(d.getMinutes());
+    const ss = pad(d.getSeconds());
+    // getTimezoneOffset returns minutes to add to local time to get UTC
+    const offsetMinutes = -d.getTimezoneOffset(); // positive if behind UTC (e.g. -300 => +300 -> -05:00)
+    const sign = offsetMinutes >= 0 ? '+' : '-';
+    const absOff = Math.abs(offsetMinutes);
+    const offH = pad(Math.floor(absOff / 60));
+    const offM = pad(absOff % 60);
+    return `${y}-${m}-${day}T${hh}:${mm}:${ss}${sign}${offH}:${offM}`;
+  }
+  // Use UTC ISO strings (with trailing Z) and omit `time_zone` so Notion stores
+  // an absolute UTC time. Notion will display the event in the user's timezone.
+  const startISO = start.toISOString();
+  const endISO = end.toISOString();
 
   const notion = new Client({ auth: token });
 
@@ -67,7 +93,6 @@ async function addToNotionCalendar({ roomCode, roomLabel, start, end }) {
           date: {
             start: startISO,
             end:   endISO,
-            time_zone: tz,
           },
         },
       },
