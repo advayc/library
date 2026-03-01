@@ -4,7 +4,8 @@
   "description": "Automate booking study rooms (Playwright).",
   "main": "booking.js",
   "scripts": {
-    "start": "node booking.js",
+    "start": "node server.js",
+    "book": "node booking.js",
     "install-deps": "npm install playwright chrono-node inquirer dotenv"
   },
   "license": "MIT",

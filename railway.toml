@@ -1,0 +1,14 @@
+[build]
+  # Railway auto-detects the Dockerfile — this file mostly sets the start command
+  # and confirms we don't need a build step beyond Docker.
+  builder = "DOCKERFILE"
+
+[deploy]
+  startCommand = "node server.js"
+  # Keep one instance running at all times (Playwright needs a warm process
+  # for fast bookings; cold-starts on serverless would be too slow).
+  numReplicas = 1
+  healthcheckPath = "/"
+  healthcheckTimeout = 30
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 3
