@@ -13,6 +13,7 @@ const { chromium } = require('playwright');
 const chrono = require('chrono-node');
 const dotenv = require('dotenv');
 const fs = require('fs');
+const { addToNotionCalendar } = require('./notion/notion');
 dotenv.config();
 
 // Parse CLI args for non-interactive runs and flags
@@ -1279,6 +1280,16 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     const timeStr  = startStr + (endPart ? ` – ${endPart}` : '');
     const roomName = roomCode ? `Meeting Room ${roomCode.replace(/^MR\s*/i, '')}` : roomLabel;
     console.log(C.green(`\n✔ ${roomName} booked for ${timeStr}`));
+  } catch {}
+
+  // ── Add to Notion Calendar ──
+  try {
+    await addToNotionCalendar({
+      roomCode: room.code  || '',
+      roomLabel: room.label || room.name || room.code || 'Room',
+      start,
+      end,
+    });
   } catch {}
 
   console.log('\nReservation flow completed. Please verify in the browser whether booking succeeded.');
