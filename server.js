@@ -100,22 +100,25 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Stream the output back so you can see progress in real time
-    res.writeHead(200, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Transfer-Encoding': 'chunked',
-      'X-Content-Type-Options': 'nosniff',
-    });
-
-    res.write(`Starting booking: "${date}" for ${capacity}+ people...\n\n`);
-
+    // Collect all output, then return a single JSON response.
+    // iPhone Shortcuts need a complete JSON body to parse — streaming won't work.
+    const lines = [];
     runBooking(date, capacity,
-      (line) => { try { res.write(line); } catch {} },
+      (line) => lines.push(line),
       (code) => {
-        try {
-          res.write(`\n--- booking.js exited with code ${code} ---\n`);
-          res.end();
-        } catch {}
+        const output = lines.join('');
+        // Try to extract the summary line (e.g. "✔ Meeting Room 304 booked for ...")
+        const summaryMatch = output.match(/✔\s*(.+)/);
+        const summary = summaryMatch ? summaryMatch[1].trim() : null;
+        const success = code === 0 || !!summary;
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          success,
+          summary: summary || (success ? 'Booking completed — check your account.' : 'Booking may have failed.'),
+          exitCode: code,
+          log: output,
+        }));
       }
     );
     return;
