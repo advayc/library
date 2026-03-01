@@ -5,7 +5,11 @@ WORKDIR /app
 
 # Copy package files and install Node deps
 COPY package*.json ./
-RUN npm ci --omit=dev
+# Use `npm install` in the build image. Some CI/build environments
+# don't provide a lockfile; `npm ci` fails when package-lock.json is
+# missing. `npm install --production` is more robust for Docker builds
+# where we only need runtime dependencies.
+RUN npm install --production --no-audit --no-fund
 
 # Install Playwright browsers (only Chromium needed)
 RUN npx playwright install chromium --with-deps
