@@ -124,43 +124,6 @@ const logger = {
   error: (...args) => console.error(...args)
 };
 
-// Declutter console: color important lines and suppress noisy output unless --debug
-(() => {
-  const origLog = console.log.bind(console);
-  const origWarn = console.warn.bind(console);
-  const origError = console.error.bind(console);
-
-  function joinArgs(args) {
-    return args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-  }
-
-  function isImportant(msg) {
-    return /^(STEP:|ERROR:|✔|Parsed time:|Reservation flow completed|Browser left open)/.test(msg);
-  }
-
-  console.log = (...args) => {
-    const msg = joinArgs(args);
-    if (ARGS.quiet && !isImportant(msg)) return;
-    if (!ARGS.debug && /DEBUG:/.test(msg)) return;
-    if (/^STEP:/.test(msg)) { origLog(C.cyan(msg)); return; }
-    if (/^ERROR:/.test(msg)) { origError(C.red(msg)); return; }
-    if (/^✔/.test(msg) || /Parsed time:/.test(msg) || /Booking appears successful!/.test(msg)) { origLog(C.green(msg)); return; }
-    // default: show only when not quiet; non-debug messages are yellow
-    origLog(ARGS.debug ? msg : C.yellow(msg));
-  };
-
-  console.warn = (...args) => {
-    const msg = joinArgs(args);
-    if (ARGS.quiet && !isImportant(msg)) return;
-    origWarn(C.yellow(msg));
-  };
-
-  console.error = (...args) => {
-    const msg = joinArgs(args);
-    origError(C.red(msg));
-  };
-})();
-
 // Structured STEP logs are always emitted (not suppressed by --quiet)
 function step(msg) {
   try { console.log('STEP: ' + String(msg)); } catch {}
@@ -315,30 +278,109 @@ function fmtDateTime(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function buildEventDateAndTime(start, end) {
+function buildEventDateAndTime(start, end, isAfter = false) {
+  const pad = (n) => String(n).padStart(2, '0');
+  // Use local date (not UTC) to avoid UTC rollover on late-night bookings
+  const dateStr = `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`;
+
+  let fromDT, toDT, timeRange, afterValue, selectedTabId;
+
+  if (isAfter) {
+    // The site's "After" tab (selectedTabId=2) uses afterValue to filter.
+    // The dateAndTime window must be 08:00–09:00 (the site ignores it for
+    // filtering; deviating from this causes it to return 0 results).
+    afterValue = `${pad(start.getHours())}:${pad(start.getMinutes())}`;
+    fromDT = `${dateStr} 08:00:00`;
+    toDT   = `${dateStr} 09:00:00`;
+    timeRange = ['08:00:00', '09:00:00'];
+    selectedTabId = 2;
+  } else {
+    // Explicit time range — encode as-is.
+    afterValue = `${pad(start.getHours())}:${pad(start.getMinutes())}`;
+    fromDT = fmtDateTime(start);
+    toDT   = fmtDateTime(end);
+    timeRange = [start.toTimeString().slice(0, 8), end.toTimeString().slice(0, 8)];
+    selectedTabId = 2;
+  }
+
   const ev = {
-    dateAndTime: [{ from_date_time: fmtDateTime(start), to_date_time: fmtDateTime(end), id: -1 }],
-    queryLastApplied: [{ from_date_time: fmtDateTime(start), to_date_time: fmtDateTime(end), id: -1 }],
-    dateRangeLastApplied: [start.toISOString().slice(0, 10)],
+    dateAndTime: [{ from_date_time: fromDT, to_date_time: toDT, id: -1 }],
+    queryLastApplied: [{ from_date_time: fromDT, to_date_time: toDT, id: -1 }],
+    dateRangeLastApplied: [dateStr],
     isAllowFullDay: false,
-    selectedTabId: 2,
-    timeRangeLastApplied: [
-      start.toTimeString().slice(0, 8),
-      end.toTimeString().slice(0, 8)
-    ],
-    afterValue: '15:30',
+    selectedTabId,
+    timeRangeLastApplied: timeRange,
+    afterValue,
     anyValue: 2
   };
   return encodeURIComponent(JSON.stringify(ev));
 }
 
 async function parseInputText(raw) {
+  // ── Detect "after HH:MM" / "after Xpm" pattern ──
+  const afterMatch = raw.match(/\bafter\s+(\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?)/i);
+
+  if (afterMatch) {
+    // Strip "after …" out so chrono only sees the day
+    const dayPart = raw.replace(/\bafter\s+\S+(?:\s*[ap]\.?m\.?)?/i, '').trim();
+
+    // Parse the day
+    const dayResults = chrono.parse(dayPart || raw);
+    if (!dayResults || dayResults.length === 0)
+      throw new Error('Could not parse a date from: ' + (dayPart || raw));
+    const dayDate = dayResults[0].start.date();
+
+    // Parse the "after" time using chrono (attach a dummy date so it resolves AM/PM)
+    const timeRaw = afterMatch[1].trim();
+    // Does the user explicitly say am/pm?
+    const hasExplicitMeridiem = /[ap]\.?m\.?/i.test(timeRaw);
+    let afterHour = 15, afterMinute = 0;   // default: 3 pm
+
+    // For bare integers like "6" or "3", skip chrono entirely — chrono can
+    // resolve small bare numbers to noon (12:00) incorrectly.
+    const bareInt = /^(\d{1,2})$/.test(timeRaw) ? parseInt(timeRaw, 10) : NaN;
+    if (!isNaN(bareInt)) {
+      afterHour   = bareInt < 12 ? bareInt + 12 : bareInt;   // always PM
+      afterMinute = 0;
+    } else {
+      const timeResults = chrono.parse(timeRaw + ' on Jan 1 2000');
+      if (timeResults && timeResults.length > 0) {
+        const t = timeResults[0].start;
+        afterHour   = t.get('hour')   ?? 15;
+        afterMinute = t.get('minute') ?? 0;
+        // chrono defaults to AM for bare times like "3:30" — if no explicit am/pm
+        // and the hour is in the range 1-11, assume PM (no one books a study room at 3 AM)
+        if (!hasExplicitMeridiem && afterHour >= 1 && afterHour < 12) {
+          afterHour += 12;
+        }
+      } else {
+        // Fallback: bare number — always assume PM for sensible meeting hours
+        const n = parseInt(timeRaw, 10);
+        if (!isNaN(n)) {
+          afterHour   = (n < 12) ? n + 12 : n;
+          afterMinute = 0;
+        }
+      }
+    }
+
+    const start = new Date(dayDate);
+    start.setHours(afterHour, afterMinute, 0, 0);
+
+    // Search window: afterTime → 10 pm
+    const end = new Date(dayDate);
+    end.setHours(22, 0, 0, 0);
+    if (end <= start) end.setTime(start.getTime() + 4 * 60 * 60 * 1000);
+
+    return { start, end, isAfter: true };
+  }
+
+  // ── Original path: explicit time range ──
   const results = chrono.parse(raw);
   if (!results || results.length === 0) throw new Error('Could not parse date/time from: ' + raw);
   const r = results[0];
   const start = r.start.date();
   const end = r.end ? r.end.date() : new Date(start.getTime() + 2 * 60 * 60 * 1000);
-  return { start, end };
+  return { start, end, isAfter: false };
 }
 
 function waitForEnter(msg) {
@@ -377,7 +419,7 @@ async function signIn(page) {
   //    The SPA renders into #app-root. We wait for any visible input to appear.
   console.log('Waiting for login form to render...');
   try {
-    await page.waitForSelector('input', { state: 'visible', timeout: 15000 });
+    await page.waitForSelector('input', { state: 'visible', timeout: 30000 });
   } catch {
     console.log('Login form did not appear in time. Checking if already logged in...');
     // If "Sign Out" or "My Account" is visible, we're already logged in
@@ -516,9 +558,9 @@ async function signIn(page) {
   // Wait for navigation or for the "Sign Out" / "My Account" text to appear
   // (indicates successful login). The site may redirect across domains.
   try {
-    await page.waitForNavigation({ waitUntil: 'load', timeout: 5000 }).catch(() => {});
+    await page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => {});
   } catch {}
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(3000);
 
     // reCAPTCHA may have triggered — check if we're still on the login page
     if (await isLoggedIn(page)) {
@@ -538,16 +580,16 @@ async function isLoggedIn(page) {
   try {
     const signOut = page.locator('text=Sign Out').first();
     const myAccount = page.locator('text=My Account').first();
-    if (await signOut.isVisible({ timeout: 600 })) return true;
-    if (await myAccount.isVisible({ timeout: 600 })) return true;
+    if (await signOut.isVisible({ timeout: 1000 })) return true;
+    if (await myAccount.isVisible({ timeout: 1000 })) return true;
   } catch {}
   return false;
 }
 
 /* ───────── search & present choices ────────────────────────────────────── */
 
-async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
-  const encoded = buildEventDateAndTime(start, end);
+async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}, isAfter = false) {
+  const encoded = buildEventDateAndTime(start, end, isAfter);
   const url = `${BASE_SEARCH}?eventTypeIds=110%2C120&reservationGroupIds=7&eventDateAndTime=${encoded}`;
 
   console.log('\nNavigating to search results...');
@@ -555,20 +597,15 @@ async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
 
   // Wait for the SPA to render results
   console.log('Waiting for results to load...');
-  // Shorter wait: prefer waiting for results container if present
-  try {
-       await page.waitForSelector('div.card-package__card.item-searched', { timeout: 300 });
-  } catch {
-    await page.waitForTimeout(300);
-  }
+  await page.waitForTimeout(4000);
 
   // Click "Search" button if present (sometimes needed to trigger the query)
   const searchBtn = page.locator('button:has-text("Search")').first();
   try {
-    if (await searchBtn.isVisible({ timeout: 800 })) {
+    if (await searchBtn.isVisible({ timeout: 2000 })) {
       await searchBtn.click();
       console.log('Clicked Search button.');
-      try { await page.waitForSelector('div.card-package__card.item-searched', { timeout: 300 }); } catch { await page.waitForTimeout(100); }
+      await page.waitForTimeout(4000);
     }
   } catch {}
 
@@ -617,7 +654,27 @@ async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
         if (ariaLabel.includes(selectedRoom.code)) score += 50;
       }
 
-      rooms.push({ label, roomCode, roomNum, capacity, score, cardHandle: card });
+      // ── Try to extract the actual time slot from the card's visible text ──
+      let slotStart = null, slotEnd = null;
+      try {
+        const cardText = await card.evaluate(n => n.innerText || '');
+        // Separator: dash, en-dash, em-dash, or word "to"
+        const SEP = '(?:\\s*[-\u2013\u2014]\\s*|\\s+to\\s+)';
+        // e.g. "3:30 PM to 5:30 PM" or "4:00 PM – 6:00 PM" or "16:00 – 18:00"
+        const tPat1 = new RegExp(`(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))${SEP}(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))`);
+        const tPat2 = new RegExp(`(\\d{2}:\\d{2})${SEP}(\\d{2}:\\d{2})`);
+        // Also scan the aria-label which reads "Mar 10, 2026, 3:30 PM to 5:30 PM Available"
+        const tm = cardText.match(tPat1) || ariaLabel.match(tPat1)
+                || cardText.match(tPat2) || ariaLabel.match(tPat2);
+        if (tm) {
+          const baseDate = start.toDateString();
+          const s = new Date(`${baseDate} ${tm[1]}`);
+          const e = new Date(`${baseDate} ${tm[2]}`);
+          if (!isNaN(s) && !isNaN(e)) { slotStart = s; slotEnd = e; }
+        }
+      } catch {}
+
+      rooms.push({ label, roomCode, roomNum, capacity, score, slotStart, slotEnd, cardHandle: card });
     } catch {
       continue;
     }
@@ -657,10 +714,22 @@ async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
     return rooms;
   }
 
-  const choices = rooms.map((r, i) => ({
-    name: `${C.cyan((i + 1) + '.')} ${C.green(r.label)} ${C.yellow('[' + r.roomCode + ']')}`,
-    value: i
-  }));
+  const fmtSlot = (d) => {
+    if (!d) return '';
+    const h = d.getHours() % 12 || 12;
+    const m = d.getMinutes();
+    const ap = d.getHours() >= 12 ? 'pm' : 'am';
+    return `${h}${m ? ':' + String(m).padStart(2, '0') : ''}${ap}`;
+  };
+  const choices = rooms.map((r, i) => {
+    const slotStr = r.slotStart && r.slotEnd
+      ? C.magenta(` — ${fmtSlot(r.slotStart)}–${fmtSlot(r.slotEnd)}`)
+      : '';
+    return {
+      name: `${C.cyan((i + 1) + '.')} ${C.green(r.label)}${slotStr} ${C.yellow('[' + r.roomCode + ']')}`,
+      value: i
+    };
+  });
 
   // Auto mode: pick highest-scoring (or first) option
   if (ARGS.auto) {
@@ -679,6 +748,80 @@ async function searchAndChooseRoom(page, start, end, selectedRoom, opts = {}) {
   return rooms[roomIndex];
 }
 
+/* ───────── scrape confirmed time from page ────────────────────────────── */
+
+/**
+ * After booking, try to read the actual confirmed date/time from the page.
+ * Searches visible text for patterns like "March 9, 2026 4:00 PM – 6:00 PM",
+ * "Mon Mar 9", "16:00–18:00", etc.
+ * Returns { start: Date, end: Date } or null if nothing parseable is found.
+ */
+async function scrapeConfirmedTime(page) {
+  try {
+    await page.waitForLoadState('load').catch(() => {});
+    await page.waitForTimeout(1500);
+
+    // Grab all visible text from the page
+    const bodyText = await page.evaluate(() => document.body.innerText || '');
+
+    // ── Pattern 1: "Month D, YYYY … H:MM AM/PM to/– H:MM AM/PM"
+    // Also handles "Mar 10, 2026, 3:30 PM to 5:30 PM Available" from booking cards
+    const SEP1 = '(?:\\s*[-\u2013\u2014]\\s*|\\s+to\\s+)';
+    const pat1 = new RegExp(
+      '\\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)' +
+      '\\s+(\\d{1,2}),?\\s+(\\d{4})[^\\n]{0,80}?' +
+      '(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))' + SEP1 +
+      '(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))', 'i'
+    );
+    const m1 = bodyText.match(pat1);
+    if (m1) {
+      const dateStr = `${m1[1]} ${m1[2]}, ${m1[3]}`;
+      const s = new Date(`${dateStr} ${m1[4]}`);
+      const e = new Date(`${dateStr} ${m1[5]}`);
+      if (!isNaN(s) && !isNaN(e)) {
+        console.log(C.cyan(`[confirmed time from page] ${s.toLocaleTimeString()} – ${e.toLocaleTimeString()}`));
+        return { start: s, end: e };
+      }
+    }
+
+    // ── Pattern 2: "YYYY-MM-DD HH:MM" style (from URL params or data attrs)
+    const pat2 = /(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2})/g;
+    const dates = [];
+    let m2;
+    while ((m2 = pat2.exec(bodyText)) !== null) {
+      const d = new Date(`${m2[1]}T${m2[2]}:00`);
+      if (!isNaN(d)) dates.push(d);
+    }
+    if (dates.length >= 2) {
+      dates.sort((a, b) => a - b);
+      console.log(C.cyan(`[confirmed time from page] ${dates[0].toLocaleTimeString()} – ${dates[dates.length - 1].toLocaleTimeString()}`));
+      return { start: dates[0], end: dates[dates.length - 1] };
+    }
+
+    // ── Pattern 3: "H:MM pm to/– H:MM pm" on same line (no date — use start's date)
+    const SEP3 = '(?:\\s*[-\u2013\u2014]\\s*|\\s+to\\s+)';
+    const pat3 = new RegExp(`\\b(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))${SEP3}(\\d{1,2}:\\d{2}\\s*(?:AM|PM|am|pm))`);
+    const m3 = bodyText.match(pat3);
+    if (m3) {
+      // Try to find a date nearby in the surrounding text
+      const datePat = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})/i;
+      const md = bodyText.match(datePat);
+      if (md) {
+        const dateStr = `${md[1]} ${md[2]}, ${md[3]}`;
+        const s = new Date(`${dateStr} ${m3[1]}`);
+        const e = new Date(`${dateStr} ${m3[2]}`);
+        if (!isNaN(s) && !isNaN(e)) {
+          console.log(C.cyan(`[confirmed time from page] ${s.toLocaleTimeString()} – ${e.toLocaleTimeString()}`));
+          return { start: s, end: e };
+        }
+      }
+    }
+  } catch (err) {
+    console.log('Note: could not scrape confirmed time from page —', err.message || err);
+  }
+  return null;
+}
+
 /* ───────── reservation flow ───────────────────────────────────────────── */
 
 async function completeReservation(page, room, attendees = 1, signaturePath = null, start = null, end = null) {
@@ -692,7 +835,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     // Use Promise.race: either navigation fires, or we time out after 10s
     // (SPA may do a pushState without a full navigation event)
     await Promise.race([
-      page.waitForNavigation({ waitUntil: 'load', timeout: 4000 }).catch(() => {}),
+      page.waitForNavigation({ waitUntil: 'load', timeout: 10000 }).catch(() => {}),
       (async () => {
         await room.cardHandle.click();
       })()
@@ -700,7 +843,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   } catch {}
 
   // Give the SPA extra time to settle after click + possible pushState
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(5000);
   await page.waitForLoadState('load').catch(() => {});
 
   const currentUrl = page.url();
@@ -716,6 +859,20 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   console.log('On the reservation page (step 1).');
+
+  // ── Try to read the actual time slot shown on step-1 ──
+  // The site may snap requested times to the nearest available slot.
+  // Capture what the page actually shows before we proceed.
+  let step1Time = null;
+  try {
+    const scraped1 = await scrapeConfirmedTime(page);
+    if (scraped1) {
+      step1Time = scraped1;
+      if (start && (scraped1.start.getTime() !== start.getTime() || (end && scraped1.end.getTime() !== end.getTime()))) {
+        console.log(C.yellow(`⚠ Note: step-1 page shows ${scraped1.start.toLocaleTimeString()}–${scraped1.end.toLocaleTimeString()} (requested ${start.toLocaleTimeString()}–${end ? end.toLocaleTimeString() : '?'})`));
+      }
+    }
+  } catch {}
 
   // ── Step B: Page 1 — set attendees by clicking "+" button, then Proceed ──
   const want = Number(attendees) || 1;
@@ -733,7 +890,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of plusSelectors) {
       try {
         const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 600 })) { plusBtn = el; break; }
+        if (await el.isVisible({ timeout: 1500 })) { plusBtn = el; break; }
       } catch {}
     }
 
@@ -741,7 +898,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const clicks = Math.max(0, want - 1);
       for (let i = 0; i < clicks; i++) {
         await plusBtn.click();
-        await page.waitForTimeout(30);
+        await page.waitForTimeout(300);
       }
       console.log(`Clicked + ${clicks} time(s) to reach ${want} attendee(s).`);
     } else {
@@ -760,7 +917,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Click "Proceed" to move to step 2
-  await page.waitForTimeout(100);
+  await page.waitForTimeout(1000);
   const proceedSelectors = [
     'button:has-text("Proceed")',
     'button:has-text("Continue")',
@@ -774,7 +931,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   for (const sel of proceedSelectors) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 600 })) {
+      if (await btn.isVisible({ timeout: 1500 })) {
         const t = (await btn.innerText()).trim();
         await btn.click();
         console.log(C.cyan(`Clicked: "${t}"`));
@@ -789,7 +946,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Wait for page 2 to load
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(5000);
   await page.waitForLoadState('load').catch(() => {});
   console.log('On reservation page (step 2) — filling in details...');
   step('reservation:fill-details');
@@ -816,7 +973,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of nameSelectors) {
       try {
         const el = page.locator(sel).first();
-        if (await el.isVisible({ timeout: 600 })) {
+        if (await el.isVisible({ timeout: 1000 })) {
           await el.click();
           await el.fill('Study Room Booking');
           console.log(`Filled event name using "${sel}".`);
@@ -857,7 +1014,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const combos = await page.locator('div.dropdown[role="combobox"], [role="combobox"]').all();
       for (const combo of combos) {
         try {
-          if (!await combo.isVisible({ timeout: 300 }).catch(() => false)) continue;
+          if (!await combo.isVisible({ timeout: 500 }).catch(() => false)) continue;
           const aria = (await combo.getAttribute('aria-label')) || '';
           const btnText = (await combo.evaluate(n => {
             const b = n.querySelector('.dropdown__button, .dropdown__button-text');
@@ -867,10 +1024,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
 
           // Open the dropdown
           const button = combo.locator('.dropdown__button').first();
-          if (await button.count() && await button.isVisible({ timeout: 600 })) {
+          if (await button.count() && await button.isVisible({ timeout: 1000 })) {
             await button.click();
             // wait for expanded state or options to appear
-            await page.waitForTimeout(30);
+            await page.waitForTimeout(300);
             const listId = await combo.getAttribute('aria-controls');
             let opt = null;
             if (listId) {
@@ -878,7 +1035,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
             } else {
               opt = combo.locator('ul li[role="option"]').first();
             }
-            if (opt && await opt.count() && await opt.isVisible({ timeout: 800 })) {
+            if (opt && await opt.count() && await opt.isVisible({ timeout: 2000 })) {
               await opt.click();
               console.log('Selected event type via custom dropdown.');
               selected = true;
@@ -902,7 +1059,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       for (const sel of typeSelectors) {
         try {
           const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 600 })) {
+          if (await el.isVisible({ timeout: 1000 })) {
             const options = await el.locator('option').all();
             let firstVal = null;
             for (const opt of options) {
@@ -931,7 +1088,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
         const allSelects = await page.locator('select').all();
         for (const sel of allSelects) {
           try {
-            if (!await sel.isVisible({ timeout: 300 })) continue;
+            if (!await sel.isVisible({ timeout: 500 })) continue;
             const opts = await sel.locator('option').all();
             if (opts.length > 1) { await sel.selectOption({ index: 1 }); console.log('Selected first option in fallback select.'); selected = true; break; }
           } catch {}
@@ -944,7 +1101,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     console.log('Error selecting event type:', err.message || err);
   }
 
-  await page.waitForTimeout(40);
+  await page.waitForTimeout(500);
 
   // 3) Check waiver / agreement checkboxes
   // Uses the React nativeInputValueSetter trick so the framework sees the state change.
@@ -954,10 +1111,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     // First: scroll any waiver text containers to the bottom (some sites require this before the checkbox activates)
     try {
       const scrollables = await page.locator('.waiver, .waiver-text, .agreement-text, [class*="waiver"], [class*="agreement"], [class*="terms"]').all();
-          for (const el of scrollables) {
+      for (const el of scrollables) {
         try {
           await el.evaluate(n => { n.scrollTop = n.scrollHeight; });
-          await page.waitForTimeout(20);
+          await page.waitForTimeout(200);
         } catch {}
       }
     } catch {}
@@ -966,7 +1123,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     const forceCheckCheckbox = async (cb) => {
       try {
         await cb.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-        await page.waitForTimeout(20);
+        await page.waitForTimeout(200);
 
         // Use nativeInputValueSetter so React's synthetic event system sees the change
         await cb.evaluate(el => {
@@ -978,22 +1135,22 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           el.dispatchEvent(new Event('change', { bubbles: true }));
           el.dispatchEvent(new Event('input',  { bubbles: true }));
         });
-        await page.waitForTimeout(15);
+        await page.waitForTimeout(150);
 
         // Also do a real Playwright click after so any non-React listeners fire too
         const cbId = await cb.getAttribute('id').catch(() => null);
-          if (cbId) {
+        if (cbId) {
           const lbl = page.locator(`label[for="${cbId}"]`).first();
-          if (await lbl.count() && await lbl.isVisible({ timeout: 150 }).catch(() => false)) {
+          if (await lbl.count() && await lbl.isVisible({ timeout: 300 }).catch(() => false)) {
             await lbl.click({ force: true });
-            await page.waitForTimeout(15);
+            await page.waitForTimeout(150);
           } else {
             await cb.click({ force: true });
-            await page.waitForTimeout(15);
+            await page.waitForTimeout(150);
           }
         } else {
           await cb.click({ force: true });
-          await page.waitForTimeout(15);
+          await page.waitForTimeout(150);
         }
         return true;
 
@@ -1035,7 +1192,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
         'input[type="checkbox"][value="agree"]'
       ).all();
       for (const cb of waivers) {
-        if (!await cb.isVisible({ timeout: 150 }).catch(() => false)) continue;
+        if (!await cb.isVisible({ timeout: 300 }).catch(() => false)) continue;
         if (await forceCheckCheckbox(cb)) checked++;
       }
     } catch {}
@@ -1045,7 +1202,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const checkboxes = await page.locator('input[type="checkbox"]').all();
       for (const cb of checkboxes) {
         try {
-          if (!await cb.isVisible({ timeout: 150 }).catch(() => false)) continue;
+          if (!await cb.isVisible({ timeout: 300 }).catch(() => false)) continue;
           if (await forceCheckCheckbox(cb)) checked++;
         } catch {}
       }
@@ -1056,7 +1213,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const roleCheckboxes = await page.locator('[role="checkbox"]').all();
       for (const el of roleCheckboxes) {
         try {
-          if (!await el.isVisible({ timeout: 150 }).catch(() => false)) continue;
+          if (!await el.isVisible({ timeout: 300 }).catch(() => false)) continue;
           await el.evaluate(n => n.scrollIntoView({ block: 'center', behavior: 'instant' }));
           await el.click({ force: true });
           checked++;
@@ -1071,7 +1228,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // Give the framework time to register the waiver state
-  await page.waitForTimeout(30);
+  await page.waitForTimeout(1200);
 
   // 4) Draw signature onto canvas using Playwright's real mouse API.
   //    signature_pad listens to PointerEvents — only page.mouse generates real ones.
@@ -1086,7 +1243,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     } else {
       // Scroll canvas into view so it has a real bounding box
       await canvasLocator.scrollIntoViewIfNeeded().catch(() => {});
-      await page.waitForTimeout(30);
+      await page.waitForTimeout(300);
 
       const box = await canvasLocator.boundingBox();
       if (!box) {
@@ -1137,10 +1294,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           const px = cx - box.width * 0.3 + t * box.width * 0.6;
           const py = cy + box.height * 0.1 - Math.sin(t * Math.PI) * box.height * 0.35;
           await page.mouse.move(px, py);
-          await page.waitForTimeout(2);
+          await page.waitForTimeout(8);
         }
         await page.mouse.up();
-        await page.waitForTimeout(30);
+        await page.waitForTimeout(300);
 
         // Verify the signature pad registered the stroke
         const isEmpty = await page.evaluate(() => {
@@ -1197,7 +1354,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     console.log('Error drawing signature:', err.message || err);
   }
 
-  await page.waitForTimeout(40);
+  await page.waitForTimeout(800);
 
   // 5) Click "Add to Cart" (or equivalent) on page 2
   // Prioritise "Add to Cart" variants first; fall back to other submit buttons.
@@ -1216,11 +1373,11 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   for (const sel of submitSelectors) {
     try {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 600 })) {
+      if (await btn.isVisible({ timeout: 1500 })) {
         const t = (await btn.innerText()).trim();
         // Scroll into view and wait briefly so any pending validation settles
         await btn.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-        await page.waitForTimeout(100);
+        await page.waitForTimeout(400);
         // Check the button is not disabled before clicking
         const isDisabled = await btn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true').catch(() => false);
         if (isDisabled) {
@@ -1240,7 +1397,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   }
 
   // 6) Wait for cart page to load, then click "Finish" to complete the order
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(4000);
   try {
     // Wait until we're on a cart/checkout page
     await page.waitForURL(/cart|checkout|shopping/i, { timeout: 8000 }).catch(() => {});
@@ -1261,7 +1418,7 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
     for (const sel of finishSelectors) {
       try {
         const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 600 })) {
+        if (await btn.isVisible({ timeout: 1500 })) {
           // Safely obtain button text or fallback to its value or selector string
           let t = String(sel);
           try {
@@ -1279,10 +1436,10 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
           }
 
           await btn.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }));
-          await page.waitForTimeout(100);
+          await page.waitForTimeout(400);
           await btn.click({ force: true });
           console.log(C.cyan(`Clicked: "${t}"`));
-          await page.waitForTimeout(800);
+          await page.waitForTimeout(3000);
           step('clicked:finish');
           break;
         }
@@ -1296,12 +1453,36 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
   const successTexts = ['Reservation Confirmed', 'Reservation Complete', 'Thank you', 'Confirmation', 'Success', 'has been added', 'receipt', 'Shopping Cart'];
   for (const txt of successTexts) {
     try {
-      if (await page.locator(`text=${txt}`).first().isVisible({ timeout: 400 })) {
+      if (await page.locator(`text=${txt}`).first().isVisible({ timeout: 1000 })) {
         console.log(C.green('\nBooking appears successful!'));
         step('booking:appears-successful');
         break;
       }
     } catch {}
+  }
+
+  // ── Read actual confirmed time from the page ──
+  // The website may snap to a different slot than what was requested, so we
+  // always try to read the real time from the confirmation page.
+  let confirmedStart = start;
+  let confirmedEnd   = end;
+  try {
+    const scraped = await scrapeConfirmedTime(page);
+    // Prefer: confirmation page → step-1 page → original requested time
+    const best = (scraped && scraped.start && scraped.end) ? scraped
+                 : (step1Time && step1Time.start && step1Time.end) ? step1Time
+                 : null;
+    if (best) {
+      if (best.start.getTime() !== start?.getTime() || best.end.getTime() !== end?.getTime()) {
+        console.log(C.yellow(`⚠ Requested ${start ? start.toLocaleTimeString() : '?'}–${end ? end.toLocaleTimeString() : '?'} but page shows ${best.start.toLocaleTimeString()}–${best.end.toLocaleTimeString()}. Using confirmed times.`));
+      }
+      confirmedStart = best.start;
+      confirmedEnd   = best.end;
+    } else {
+      console.log(C.yellow('Could not read confirmed time from page — using requested time for summary.'));
+    }
+  } catch (err) {
+    console.log('Note: error reading confirmed time —', err.message || err);
   }
 
   // ── Print human-readable booking summary ──
@@ -1317,8 +1498,8 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       const hr12 = h % 12 || 12;
       return `${days[d.getDay()]} ${months[d.getMonth()]} ${d.getDate()} ${hr12}${m ? ':' + String(m).padStart(2,'0') : ''}${ampm}`;
     };
-    const startStr = start ? fmt(start) : '';
-    const endPart  = end   ? `${(end.getHours()%12||12)}${end.getMinutes() ? ':'+String(end.getMinutes()).padStart(2,'0') : ''}${end.getHours()>=12?'pm':'am'}` : '';
+    const startStr = confirmedStart ? fmt(confirmedStart) : '';
+    const endPart  = confirmedEnd   ? `${(confirmedEnd.getHours()%12||12)}${confirmedEnd.getMinutes() ? ':'+String(confirmedEnd.getMinutes()).padStart(2,'0') : ''}${confirmedEnd.getHours()>=12?'pm':'am'}` : '';
     const timeStr  = startStr + (endPart ? ` – ${endPart}` : '');
     const roomName = roomCode ? `Meeting Room ${roomCode.replace(/^MR\s*/i, '')}` : roomLabel;
     console.log(C.green(`\n✔ ${roomName} booked for ${timeStr}`));
@@ -1330,8 +1511,8 @@ async function completeReservation(page, room, attendees = 1, signaturePath = nu
       roomCode: room.roomCode || room.code || '',
       roomNum:  room.roomNum  || '',
       roomLabel: room.label || room.name || room.roomCode || room.code || 'Room',
-      start,
-      end,
+      start: confirmedStart,
+      end:   confirmedEnd,
     });
   } catch {}
 
@@ -1347,7 +1528,7 @@ async function main() {
   logger.info(C.green('Use arrow keys to navigate lists, Enter to confirm, Esc to cancel.'));
 
    const whenAns = await ask([
-    { name: 'dateText', message: 'When would you like to book? (natural language, e.g. "wednesday march 4 6-8pm")', type: 'input' }
+    { name: 'dateText', message: 'When? (day + "after" time — e.g. "monday march 9 after 3:30" or exact range "march 9 5-7pm")', type: 'input' }
   ]);
 
    const raw = whenAns.dateText || ARGS.dateText;
@@ -1374,8 +1555,9 @@ async function main() {
    const defaultSig = './signature.png';
    const signaturePath = ARGS.signaturePath ? (fs.existsSync(ARGS.signaturePath) ? ARGS.signaturePath : null) : (fs.existsSync(defaultSig) ? defaultSig : null);
 
-  const { start, end } = await parseInputText(raw);
-   console.log(C.green('\nParsed time:') + ` ${start.toString()} -> ${end.toString()}`);
+  const parsed = await parseInputText(raw);
+  const { start, end, isAfter } = parsed;
+   console.log(C.green('\nParsed time:') + ` ${start.toString()} -> ${end.toString()} (${isAfter ? 'after' : 'explicit'})`);
 
    // ── Launch browser with persistent profile ──
    const profileDir = './playwright_profile';
@@ -1396,7 +1578,7 @@ async function main() {
 
     // If list-only flag provided, show filtered live rooms and exit
     if (ARGS.listOnly) {
-      const rooms = await searchAndChooseRoom(page, start, end, null, { listOnly: true, requiredCapacity });
+      const rooms = await searchAndChooseRoom(page, start, end, null, { listOnly: true, requiredCapacity }, isAfter);
       if (Array.isArray(rooms)) {
         console.log('\nListing complete. Browser left open for manual inspection.');
         return;
@@ -1406,14 +1588,14 @@ async function main() {
     }
 
     // Step 2: Search live site and let the user pick one of the actual live options
-    const room = await searchAndChooseRoom(page, start, end, null, { listOnly: false, requiredCapacity });
+    const room = await searchAndChooseRoom(page, start, end, null, { listOnly: false, requiredCapacity }, isAfter);
     if (!room) {
       console.log('No live room selected. Leaving browser open for manual use.');
       return;
     }
 
-    // Step 3: Complete the reservation
-    await completeReservation(page, room, attendees, signaturePath, start, end);
+    // Step 3: Complete the reservation (prefer per-room slot time over broad search window)
+    await completeReservation(page, room, attendees, signaturePath, room.slotStart || start, room.slotEnd || end);
 
   } catch (err) {
     console.error('Error:', err.message);
